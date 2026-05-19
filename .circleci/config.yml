@@ -1,0 +1,175 @@
+version: 2.1
+
+orbs:
+  maven: circleci/maven@1.4.1
+
+# -----------------------------------------------------------------------
+# Executors
+# -----------------------------------------------------------------------
+executors:
+  jdk21:
+    docker:
+      - image: cimg/openjdk:21.0
+    resource_class: medium
+    environment:
+      MAVEN_OPTS: "-Xmx2g -XX:+TieredCompilation -XX:TieredStopAtLevel=1"
+
+# -----------------------------------------------------------------------
+# Commands
+# -----------------------------------------------------------------------
+commands:
+  restore_maven_cache:
+    steps:
+      - restore_cache:
+          keys:
+            - maven-deps-v1-{{ checksum "pom.xml" }}-{{ checksum "plugin/pom.xml" }}-{{ checksum "test-harness/pom.xml" }}-{{ checksum "integrations/pom.xml" }}
+            - maven-deps-v1-{{ checksum "pom.xml" }}
+            - maven-deps-v1-
+
+  save_maven_cache:
+    steps:
+      - save_cache:
+          key: maven-deps-v1-{{ checksum "pom.xml" }}-{{ checksum "plugin/pom.xml" }}-{{ checksum "test-harness/pom.xml" }}-{{ checksum "integrations/pom.xml" }}
+          paths:
+            - ~/.m2/repository
+
+# -----------------------------------------------------------------------
+# Jobs
+# -----------------------------------------------------------------------
+jobs:
+  # ------------------------------------------------------------
+  # Download & cache all Maven dependencies
+  # ------------------------------------------------------------
+  dependencies:
+    executor: jdk21
+    steps:
+      - checkout
+      - restore_maven_cache
+      - run:
+          name: Resolve dependencies (offline-ready after first run)
+          command: |
+            mvn --batch-mode dependency:go-offline \
+              -Dmaven.test.skip=true \
+              --no-transfer-progress
+      - save_maven_cache
+
+  # ------------------------------------------------------------
+  # Lint — Checkstyle + Spotless format check
+  # ------------------------------------------------------------
+  lint:
+    executor: jdk21
+    steps:
+      - checkout
+      - restore_maven_cache
+      - run:
+          name: Checkstyle
+          command: |
+            mvn --batch-mode checkstyle:check \
+              --no-transfer-progress \
+              -Dmaven.test.skip=true
+      - run:
+          name: Spotless format check
+          command: |
+            mvn --batch-mode spotless:check \
+              --no-transfer-progress \
+              -Dmaven.test.skip=true \
+              || echo "Spotless check failed — run 'mvn spotless:apply' locally to auto-fix formatting."
+          # Remove '|| echo ...' and the comment if you want the job to fail hard on format issues.
+
+  # ------------------------------------------------------------
+  # Test — unit + integration tests across all modules
+  # ------------------------------------------------------------
+  test:
+    executor: jdk21
+    steps:
+      - checkout
+      - restore_maven_cache
+      - run:
+          name: Run tests (all modules)
+          command: |
+            mvn --batch-mode verify \
+              --no-transfer-progress \
+              -Dspotless.check.skip=true
+          no_output_timeout: 30m
+      - run:
+          name: Collect Surefire / Failsafe reports
+          when: always
+          command: |
+            mkdir -p /tmp/test-results
+            find . -path "*/surefire-reports/*.xml" -exec cp {} /tmp/test-results/ \;
+            find . -path "*/failsafe-reports/*.xml" -exec cp {} /tmp/test-results/ \;
+      - store_test_results:
+          path: /tmp/test-results
+      - store_artifacts:
+          path: /tmp/test-results
+          destination: test-results
+
+  # ------------------------------------------------------------
+  # Build — compile & package the HPI artifact (skip tests here;
+  # tests already ran in the 'test' job)
+  # ------------------------------------------------------------
+  build:
+    executor: jdk21
+    steps:
+      - checkout
+      - restore_maven_cache
+      - run:
+          name: Build and package HPI
+          command: |
+            mvn --batch-mode package \
+              --no-transfer-progress \
+              -Dmaven.test.skip=true \
+              -Dspotless.check.skip=true
+      - store_artifacts:
+          path: plugin/target/*.hpi
+          destination: hpi
+      - store_artifacts:
+          path: plugin/target/*.jar
+          destination: jar
+      - persist_to_workspace:
+          root: .
+          paths:
+            - plugin/target/*.hpi
+            - plugin/target/*.jar
+
+# -----------------------------------------------------------------------
+# Workflows
+# -----------------------------------------------------------------------
+workflows:
+  ci:
+    jobs:
+      - dependencies
+      - lint:
+          requires:
+            - dependencies
+      - test:
+          requires:
+            - dependencies
+      - build:
+          requires:
+            - test
+
+# -----------------------------------------------------------------------
+# Deploy job stub — fill in with your deployment details before enabling
+# -----------------------------------------------------------------------
+# jobs:
+#   deploy:
+#     executor: jdk21
+#     steps:
+#       - attach_workspace:
+#           at: .
+#       - run:
+#           name: Deploy HPI artifact
+#           command: |
+#             # Example: upload to Jenkins Update Center, S3, Artifactory, etc.
+#             # Requires secrets/environment variables to be configured in
+#             # CircleCI project settings or an org-level context.
+#             echo "TODO: add your deployment steps here"
+#
+# Add to the workflow after 'build' completes:
+#   - deploy:
+#       requires:
+#         - build
+#       filters:
+#         branches:
+#           only: master
